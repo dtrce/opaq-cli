@@ -1,0 +1,26 @@
+[package]
+name = "opaq"
+version = "0.1.0"
+edition = "2021"
+description = "CLI for opaq, a self-hosted config and secret store"
+license = "MIT"
+repository = "https://github.com/dtrce/opaq-cli"
+homepage = "https://github.com/dtrce/opaq-cli"
+readme = "README.md"
+keywords = ["opaq", "secrets", "config", "cli", "vault"]
+categories = ["command-line-utilities"]
+authors = ["Dipen Javia <javia3@gmail.com>"]
+rust-version = "1.75"
+
+[[bin]]
+name = "opaq"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+rand = "0.8"
+dirs = "6"
+comfy-table = "7"
