@@ -11,6 +11,7 @@ keywords = ["opaq", "secrets", "config", "cli", "vault"]
 categories = ["command-line-utilities"]
 authors = ["Dipen Javia <javia3@gmail.com>"]
 rust-version = "1.75"
+exclude = ["AGENTS.md", "CLAUDE.md", ".worktrees/", "Cargo.lock.bak"]
 
 [[bin]]
 name = "opaq"
