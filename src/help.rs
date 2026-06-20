@@ -119,6 +119,10 @@ fn section_auth() {
             "save creds (~/.config/opaq/config.json)",
         ),
         ("opaq status", "verify stored key against the server"),
+        (
+            "OPAQ_SERVER / OPAQ_KEY",
+            "env creds (override file; skip login)",
+        ),
     ]);
     println!();
 }
@@ -186,6 +190,7 @@ fn section_examples() {
         "opaq get /acme/api/prod/STRIPE_KEY --raw | pbcopy",
         "eval \"$(opaq env /acme/api/prod --shell)\"",
         "cargo run --env-file <(opaq env /acme/api/dev)",
+        "OPAQ_SERVER=https://opaq.example.com OPAQ_KEY=opaq_abc123 opaq get /acme/api/prod/STRIPE_KEY --raw",
     ];
     for l in lines {
         println!("  {}", l);

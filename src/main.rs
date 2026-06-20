@@ -15,6 +15,9 @@ Path syntax:
   /workspace/project/key            project-scoped secret
   /workspace/project/env/key        env-scoped secret
   /workspace/project[/env]          list/env scope path
+
+Env credentials:
+  OPAQ_SERVER, OPAQ_KEY             override saved creds; skip `opaq login`
 ";
 
 const TOP_AFTER_HELP: &str = "\
@@ -293,10 +296,48 @@ fn config_path() -> PathBuf {
     config_dir().join("opaq").join("config.json")
 }
 
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+// Env vars win over the saved file so docker entrypoints can skip `opaq login`.
+// OPAQ_SERVER + OPAQ_KEY together are enough; either one alone overrides that
+// field on top of the stored config.
 fn load_config() -> CliResult<CliConfig> {
+    let env_server = env_var("OPAQ_SERVER");
+    let env_key = env_var("OPAQ_KEY");
+    resolve_config(env_server, env_key, load_config_file().ok())
+}
+
+// Env vars override the saved file; both env vars together skip the file entirely.
+fn resolve_config(
+    env_server: Option<String>,
+    env_key: Option<String>,
+    file: Option<CliConfig>,
+) -> CliResult<CliConfig> {
+    if let (Some(server), Some(api_key)) = (&env_server, &env_key) {
+        return Ok(CliConfig {
+            server: server.clone(),
+            api_key: api_key.clone(),
+        });
+    }
+
+    let mut config = file.ok_or_else(|| {
+        "not logged in. Run `opaq login --server URL --key KEY`, or set OPAQ_SERVER and OPAQ_KEY."
+            .to_string()
+    })?;
+    if let Some(server) = env_server {
+        config.server = server;
+    }
+    if let Some(api_key) = env_key {
+        config.api_key = api_key;
+    }
+    Ok(config)
+}
+
+fn load_config_file() -> CliResult<CliConfig> {
     let path = config_path();
-    let data = std::fs::read_to_string(&path)
-        .map_err(|_| "not logged in. Run: opaq login --server URL --key KEY".to_string())?;
+    let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     serde_json::from_str(&data).map_err(|e| format!("invalid config: {}", e))
 }
 
@@ -1291,5 +1332,57 @@ mod parse_ttl_tests {
     fn rejects_garbage() {
         assert!(parse_ttl("abc").is_err());
         assert!(parse_ttl("").is_err());
+    }
+}
+
+#[cfg(test)]
+mod resolve_config_tests {
+    use super::{resolve_config, CliConfig};
+
+    fn file() -> Option<CliConfig> {
+        Some(CliConfig {
+            server: "https://file.example.com".into(),
+            api_key: "file_key".into(),
+        })
+    }
+
+    #[test]
+    fn env_both_skips_file() {
+        let conf = resolve_config(
+            Some("https://env.example.com".into()),
+            Some("env_key".into()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(conf.server, "https://env.example.com");
+        assert_eq!(conf.api_key, "env_key");
+    }
+
+    #[test]
+    fn env_overrides_single_field() {
+        let conf = resolve_config(Some("https://env.example.com".into()), None, file()).unwrap();
+        assert_eq!(conf.server, "https://env.example.com");
+        assert_eq!(conf.api_key, "file_key");
+
+        let conf = resolve_config(None, Some("env_key".into()), file()).unwrap();
+        assert_eq!(conf.server, "https://file.example.com");
+        assert_eq!(conf.api_key, "env_key");
+    }
+
+    #[test]
+    fn file_only_when_no_env() {
+        let conf = resolve_config(None, None, file()).unwrap();
+        assert_eq!(conf.server, "https://file.example.com");
+        assert_eq!(conf.api_key, "file_key");
+    }
+
+    #[test]
+    fn errors_when_no_env_and_no_file() {
+        assert!(resolve_config(None, None, None).is_err());
+    }
+
+    #[test]
+    fn errors_when_partial_env_and_no_file() {
+        assert!(resolve_config(Some("https://env.example.com".into()), None, None).is_err());
     }
 }

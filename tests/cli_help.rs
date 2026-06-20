@@ -18,7 +18,11 @@ fn version_flag_prints_version() {
     assert!(out.status.success(), "exit status: {}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("opaq"), "stdout: {}", stdout);
-    assert!(stdout.contains("0.1.0"), "stdout: {}", stdout);
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "stdout: {}",
+        stdout
+    );
 }
 
 #[test]

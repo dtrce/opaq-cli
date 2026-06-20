@@ -17,6 +17,17 @@ opaq get /acme/api/prod/STRIPE_KEY --raw | pbcopy
 opaq env /acme/api/prod
 ```
 
+### Env credentials (CI / Docker)
+
+Set `OPAQ_SERVER` and `OPAQ_KEY` to make calls without running `opaq login` — handy
+for docker entrypoints. Env values override the saved `config.json`.
+
+```sh
+export OPAQ_SERVER=https://opaq.example.com
+export OPAQ_KEY=opaq_abc123
+opaq get /acme/api/prod/STRIPE_KEY --raw
+```
+
 Run `opaq help` for the full cheatsheet, or `opaq <command> --help` for details.
 
 ## License
