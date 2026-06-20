@@ -39,7 +39,7 @@ cargo publish --dry-run      # validate before crates.io publish
 - HTTP errors come back through `render_resp_error`, which extracts the server's JSON `error` field when present.
 - Path parsing: `parse_secret_path` for 3- or 4-segment secret paths (`/ws/proj/key` or `/ws/proj/env/key`), `parse_path3` for scope paths (no key).
 - Config path: `~/.config/opaq/config.json` on **all** platforms including macOS (override of dirs default `~/Library/Application Support`). 0600 perms on Unix.
-- Credentials resolution (`load_config` → `resolve_config`): env vars `OPAQ_SERVER` / `OPAQ_KEY` override the file. Both present skip the file entirely (the docker/CI path); either alone overrides that one field on top of the saved config. Empty/whitespace env values are ignored. `resolve_config` is the pure, unit-tested core.
+- Credentials resolution (`load_config` → `resolve_config`): env creds are all-or-nothing. If either `OPAQ_SERVER` or `OPAQ_KEY` is set, **both** must be set and `config.json` is ignored entirely (the docker/CI path); one set without the other is an error, never a merge with the file. No env → fall back to the file. Empty/whitespace env values are ignored. `resolve_config` is the pure, unit-tested core.
 - New flags: prefer kebab-case (`--no-ttl`, `--string-path`).
 
 ## Server contract

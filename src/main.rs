@@ -309,30 +309,22 @@ fn load_config() -> CliResult<CliConfig> {
     resolve_config(env_server, env_key, load_config_file().ok())
 }
 
-// Env vars override the saved file; both env vars together skip the file entirely.
+// Env creds are all-or-nothing: if either OPAQ_SERVER or OPAQ_KEY is set, both must
+// be set and config.json is ignored. Otherwise fall back to the saved file.
 fn resolve_config(
     env_server: Option<String>,
     env_key: Option<String>,
     file: Option<CliConfig>,
 ) -> CliResult<CliConfig> {
-    if let (Some(server), Some(api_key)) = (&env_server, &env_key) {
-        return Ok(CliConfig {
-            server: server.clone(),
-            api_key: api_key.clone(),
-        });
+    match (env_server, env_key) {
+        (Some(server), Some(api_key)) => Ok(CliConfig { server, api_key }),
+        (Some(_), None) => Err("OPAQ_SERVER is set but OPAQ_KEY is missing.".to_string()),
+        (None, Some(_)) => Err("OPAQ_KEY is set but OPAQ_SERVER is missing.".to_string()),
+        (None, None) => file.ok_or_else(|| {
+            "not logged in. Run `opaq login --server URL --key KEY`, or set OPAQ_SERVER and OPAQ_KEY."
+                .to_string()
+        }),
     }
-
-    let mut config = file.ok_or_else(|| {
-        "not logged in. Run `opaq login --server URL --key KEY`, or set OPAQ_SERVER and OPAQ_KEY."
-            .to_string()
-    })?;
-    if let Some(server) = env_server {
-        config.server = server;
-    }
-    if let Some(api_key) = env_key {
-        config.api_key = api_key;
-    }
-    Ok(config)
 }
 
 fn load_config_file() -> CliResult<CliConfig> {
@@ -1359,14 +1351,10 @@ mod resolve_config_tests {
     }
 
     #[test]
-    fn env_overrides_single_field() {
-        let conf = resolve_config(Some("https://env.example.com".into()), None, file()).unwrap();
-        assert_eq!(conf.server, "https://env.example.com");
-        assert_eq!(conf.api_key, "file_key");
-
-        let conf = resolve_config(None, Some("env_key".into()), file()).unwrap();
-        assert_eq!(conf.server, "https://file.example.com");
-        assert_eq!(conf.api_key, "env_key");
+    fn partial_env_errors_even_with_file() {
+        // env is all-or-nothing: one var set never merges with the file
+        assert!(resolve_config(Some("https://env.example.com".into()), None, file()).is_err());
+        assert!(resolve_config(None, Some("env_key".into()), file()).is_err());
     }
 
     #[test]
