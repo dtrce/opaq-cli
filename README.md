@@ -28,6 +28,10 @@ export OPAQ_KEY=opaq_abc123
 opaq get /acme/api/prod/STRIPE_KEY --raw
 ```
 
+For wiring opaq into a Docker image + entrypoint, see
+[`skills/opaq-docker-entrypoint`](skills/opaq-docker-entrypoint/SKILL.md) — a guide you
+can hand straight to a coding agent.
+
 Run `opaq help` for the full cheatsheet, or `opaq <command> --help` for details.
 
 ## License

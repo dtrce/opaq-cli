@@ -19,6 +19,8 @@ tests/cli_help.rs # integration tests, spawn the bin, assert on --help / help ou
 
 Single `[[bin]]` named `opaq`. No library crate.
 
+`skills/opaq-docker-entrypoint/SKILL.md` — drop-in guide for agents wiring opaq into a Docker image + entrypoint via `OPAQ_SERVER`/`OPAQ_KEY`. Hand it to a consumer-repo agent verbatim.
+
 ## Common commands
 
 ```sh
@@ -37,6 +39,7 @@ cargo publish --dry-run      # validate before crates.io publish
 - HTTP errors come back through `render_resp_error`, which extracts the server's JSON `error` field when present.
 - Path parsing: `parse_secret_path` for 3- or 4-segment secret paths (`/ws/proj/key` or `/ws/proj/env/key`), `parse_path3` for scope paths (no key).
 - Config path: `~/.config/opaq/config.json` on **all** platforms including macOS (override of dirs default `~/Library/Application Support`). 0600 perms on Unix.
+- Credentials resolution (`load_config` → `resolve_config`): env vars `OPAQ_SERVER` / `OPAQ_KEY` override the file. Both present skip the file entirely (the docker/CI path); either alone overrides that one field on top of the saved config. Empty/whitespace env values are ignored. `resolve_config` is the pure, unit-tested core.
 - New flags: prefer kebab-case (`--no-ttl`, `--string-path`).
 
 ## Server contract
