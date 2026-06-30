@@ -4,6 +4,7 @@ mod style;
 use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Color};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use style::{ansi, bold, dim, make_table};
@@ -280,6 +281,25 @@ struct CliConfig {
     api_key: String,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct ProfileStore {
+    profiles: BTreeMap<String, CliConfig>,
+}
+
+// Parses the new profile-map shape. If the data is instead the legacy flat
+// {server, api_key} config, wrap it as the `default` profile (one-time migration).
+fn parse_store(data: &str) -> CliResult<ProfileStore> {
+    if let Ok(store) = serde_json::from_str::<ProfileStore>(data) {
+        return Ok(store);
+    }
+    // Fall back to the legacy flat shape before giving up.
+    let flat: CliConfig = serde_json::from_str(data)
+        .map_err(|e| format!("invalid config: {}", e))?;
+    let mut profiles = BTreeMap::new();
+    profiles.insert("default".to_string(), flat);
+    Ok(ProfileStore { profiles })
+}
+
 type CliResult<T> = Result<T, String>;
 
 fn config_dir() -> PathBuf {
@@ -340,6 +360,41 @@ fn save_config(config: &CliConfig) -> CliResult<()> {
         .ok_or_else(|| "could not determine config directory".to_string())?;
     std::fs::create_dir_all(parent).map_err(|e| format!("failed to create config dir: {}", e))?;
     let body = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("failed to serialize config: {}", e))?;
+    std::fs::write(&path, body).map_err(|e| format!("failed to write config: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&path)
+            .map_err(|e| format!("failed to read config permissions: {}", e))?
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms)
+            .map_err(|e| format!("failed to set config permissions: {}", e))?;
+    }
+    Ok(())
+}
+
+// Reads the config file into a ProfileStore. If the file was the legacy flat
+// shape, it is migrated and rewritten in place so the next read is the new shape.
+fn load_store() -> CliResult<ProfileStore> {
+    let path = config_path();
+    let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let was_flat = serde_json::from_str::<ProfileStore>(&data).is_err();
+    let store = parse_store(&data)?;
+    if was_flat {
+        save_store(&store)?;
+    }
+    Ok(store)
+}
+
+fn save_store(store: &ProfileStore) -> CliResult<()> {
+    let path = config_path();
+    let parent = path
+        .parent()
+        .ok_or_else(|| "could not determine config directory".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("failed to create config dir: {}", e))?;
+    let body = serde_json::to_string_pretty(store)
         .map_err(|e| format!("failed to serialize config: {}", e))?;
     std::fs::write(&path, body).map_err(|e| format!("failed to write config: {}", e))?;
     #[cfg(unix)]
@@ -1372,5 +1427,45 @@ mod resolve_config_tests {
     #[test]
     fn errors_when_partial_env_and_no_file() {
         assert!(resolve_config(Some("https://env.example.com".into()), None, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod profile_store_tests {
+    use super::{parse_store, CliConfig, ProfileStore};
+
+    #[test]
+    fn parses_new_shape() {
+        let json = r#"{"profiles":{"work":{"server":"https://w.com","api_key":"wk"}}}"#;
+        let store = parse_store(json).unwrap();
+        assert_eq!(store.profiles["work"].server, "https://w.com");
+        assert_eq!(store.profiles["work"].api_key, "wk");
+    }
+
+    #[test]
+    fn migrates_flat_shape_into_default() {
+        // old config.json was a bare {server, api_key}
+        let json = r#"{"server":"https://old.com","api_key":"oldkey"}"#;
+        let store = parse_store(json).unwrap();
+        assert_eq!(store.profiles.len(), 1);
+        assert_eq!(store.profiles["default"].server, "https://old.com");
+        assert_eq!(store.profiles["default"].api_key, "oldkey");
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_store("not json").is_err());
+    }
+
+    #[test]
+    fn round_trips_through_serde() {
+        let mut store = ProfileStore::default();
+        store.profiles.insert(
+            "default".into(),
+            CliConfig { server: "https://s.com".into(), api_key: "k".into() },
+        );
+        let json = serde_json::to_string(&store).unwrap();
+        let back = parse_store(&json).unwrap();
+        assert_eq!(back.profiles["default"].server, "https://s.com");
     }
 }
