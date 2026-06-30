@@ -69,6 +69,9 @@ Options:
     disable_help_subcommand = true,
 )]
 struct Cli {
+    /// Credential profile to use (overrides OPAQ_PROFILE; defaults to `default`)
+    #[arg(long, global = true)]
+    profile: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -362,34 +365,6 @@ fn pick_profile(store: Option<ProfileStore>, name: &str) -> CliResult<CliConfig>
         .get(name)
         .map(|c| CliConfig { server: c.server.clone(), api_key: c.api_key.clone() })
         .ok_or_else(|| format!("profile '{}' not found", name))
-}
-
-fn load_config_file() -> CliResult<CliConfig> {
-    let path = config_path();
-    let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&data).map_err(|e| format!("invalid config: {}", e))
-}
-
-fn save_config(config: &CliConfig) -> CliResult<()> {
-    let path = config_path();
-    let parent = path
-        .parent()
-        .ok_or_else(|| "could not determine config directory".to_string())?;
-    std::fs::create_dir_all(parent).map_err(|e| format!("failed to create config dir: {}", e))?;
-    let body = serde_json::to_string_pretty(config)
-        .map_err(|e| format!("failed to serialize config: {}", e))?;
-    std::fs::write(&path, body).map_err(|e| format!("failed to write config: {}", e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&path)
-            .map_err(|e| format!("failed to read config permissions: {}", e))?
-            .permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&path, perms)
-            .map_err(|e| format!("failed to set config permissions: {}", e))?;
-    }
-    Ok(())
 }
 
 // Reads the config file into a ProfileStore. If the file was the legacy flat
@@ -885,6 +860,7 @@ fn format_unix_secs(s: &str) -> String {
 
 fn run() -> CliResult<()> {
     let cli = Cli::parse();
+    let profile = cli.profile.clone();
 
     match cli.command {
         Command::Genkey { length } => {
@@ -902,16 +878,16 @@ fn run() -> CliResult<()> {
             Ok(())
         }
         Command::Login { server, key } => {
-            let config = CliConfig {
-                server,
-                api_key: key,
-            };
-            save_config(&config)?;
-            println!("Logged in.");
+            let name = profile.clone().unwrap_or_else(|| "default".to_string());
+            // Preserve any existing profiles; start fresh if no file yet.
+            let mut store = load_store().unwrap_or_default();
+            store.profiles.insert(name.clone(), CliConfig { server, api_key: key });
+            save_store(&store)?;
+            println!("Logged in (profile: {}).", name);
             Ok(())
         }
         Command::Status => {
-            let config = load_config()?;
+            let config = load_config(profile.clone())?;
             let url = api_url(&config, "me");
             let resp = client()
                 .get(&url)
@@ -950,7 +926,7 @@ fn run() -> CliResult<()> {
             json,
             json_path,
         } => {
-            let config = load_config()?;
+            let config = load_config(profile.clone())?;
             let (ws, proj, env, key) = parse_secret_path(&path)?;
 
             let (val, vtype) = match (string, string_path, json, json_path) {
@@ -1005,7 +981,7 @@ fn run() -> CliResult<()> {
             }
         }
         Command::Get { path, raw } => {
-            let config = load_config()?;
+            let config = load_config(profile.clone())?;
             let (ws, proj, env, key) = parse_secret_path(&path)?;
             let url = api_url(&config, &secret_url_path(ws, proj, env, key));
             let resp = client()
@@ -1034,7 +1010,7 @@ fn run() -> CliResult<()> {
             values,
             no_merge,
         } => {
-            let config = load_config()?;
+            let config = load_config(profile.clone())?;
             let (ws, proj, env_opt) = parse_path3(&path)?;
             let mut url = match &env_opt {
                 Some(env) => api_url(&config, &format!("list/{}/{}/{}", ws, proj, env)),
@@ -1078,7 +1054,7 @@ fn run() -> CliResult<()> {
             shell,
             preserve_case,
         } => {
-            let config = load_config()?;
+            let config = load_config(profile.clone())?;
             let trimmed = path.trim_matches('/');
             let parts: Vec<&str> = trimmed.split('/').collect();
             if parts.len() != 3 || parts.iter().any(|s| s.is_empty()) {
@@ -1156,7 +1132,7 @@ fn run() -> CliResult<()> {
             Ok(())
         }
         Command::Rm { path } => {
-            let config = load_config()?;
+            let config = load_config(profile.clone())?;
             let (ws, proj, env, key) = parse_secret_path(&path)?;
             let url = api_url(&config, &secret_url_path(ws, proj, env, key));
             let resp = client()
@@ -1180,7 +1156,7 @@ fn run() -> CliResult<()> {
                 no_ttl,
                 rename,
             } => {
-                let config = load_config()?;
+                let config = load_config(profile.clone())?;
                 let ttl_seconds = ttl.as_deref().map(parse_ttl).transpose()?;
                 let mut payload = serde_json::json!({ "name": name });
                 if let Some(r) = &role {
@@ -1236,7 +1212,7 @@ fn run() -> CliResult<()> {
                 Ok(())
             }
             PrincipalCmd::List => {
-                let config = load_config()?;
+                let config = load_config(profile.clone())?;
                 let url = api_url(&config, "principals");
                 let resp = client()
                     .get(&url)
@@ -1277,7 +1253,7 @@ fn run() -> CliResult<()> {
                 Ok(())
             }
             PrincipalCmd::Rotate { id, name } => {
-                let config = load_config()?;
+                let config = load_config(profile.clone())?;
                 let resolved_name = match (id, name) {
                     (Some(id), _) => lookup_principal_name_by_id(&config, id)?,
                     (None, Some(name)) => name,
@@ -1318,7 +1294,7 @@ fn run() -> CliResult<()> {
                 Ok(())
             }
             PrincipalCmd::Revoke { id, name } => {
-                let config = load_config()?;
+                let config = load_config(profile.clone())?;
                 let resolved_id = match (id, name) {
                     (Some(id), _) => id,
                     (None, Some(name)) => lookup_principal_id_by_name(&config, &name)?,
