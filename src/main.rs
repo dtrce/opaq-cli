@@ -4,6 +4,7 @@ mod style;
 use clap::{Parser, Subcommand};
 use comfy_table::{Cell, Color};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use style::{ansi, bold, dim, make_table};
@@ -68,6 +69,9 @@ Options:
     disable_help_subcommand = true,
 )]
 struct Cli {
+    /// Credential profile to use (overrides OPAQ_PROFILE; defaults to `default`)
+    #[arg(long, global = true)]
+    profile: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -200,6 +204,11 @@ Topics:
         /// Topic: auth | secrets | admin | paths | examples
         topic: Option<String>,
     },
+    /// Manage credential profiles
+    Profile {
+        #[command(subcommand)]
+        cmd: ProfileCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -274,10 +283,40 @@ Examples:
     List,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Subcommand)]
+enum ProfileCmd {
+    /// List saved profiles
+    List,
+    /// Remove a saved profile
+    Remove {
+        /// Profile name to delete
+        name: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct CliConfig {
     server: String,
     api_key: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct ProfileStore {
+    profiles: BTreeMap<String, CliConfig>,
+}
+
+// Parses the new profile-map shape. If the data is instead the legacy flat
+// {server, api_key} config, wrap it as the `default` profile (one-time migration).
+fn parse_store(data: &str) -> CliResult<ProfileStore> {
+    if let Ok(store) = serde_json::from_str::<ProfileStore>(data) {
+        return Ok(store);
+    }
+    // Fall back to the legacy flat shape before giving up.
+    let flat: CliConfig = serde_json::from_str(data)
+        .map_err(|e| format!("invalid config: {}", e))?;
+    let mut profiles = BTreeMap::new();
+    profiles.insert("default".to_string(), flat);
+    Ok(ProfileStore { profiles })
 }
 
 type CliResult<T> = Result<T, String>;
@@ -300,46 +339,94 @@ fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
-// Env vars win over the saved file so docker entrypoints can skip `opaq login`.
-// OPAQ_SERVER + OPAQ_KEY together are enough; either one alone overrides that
-// field on top of the stored config.
-fn load_config() -> CliResult<CliConfig> {
-    let env_server = env_var("OPAQ_SERVER");
-    let env_key = env_var("OPAQ_KEY");
-    resolve_config(env_server, env_key, load_config_file().ok())
+fn load_config(flag_profile: Option<String>) -> CliResult<CliConfig> {
+    resolve_config(
+        flag_profile,
+        env_var("OPAQ_PROFILE"),
+        env_var("OPAQ_SERVER"),
+        env_var("OPAQ_KEY"),
+        load_store().ok(),
+    )
 }
 
-// Env creds are all-or-nothing: if either OPAQ_SERVER or OPAQ_KEY is set, both must
-// be set and config.json is ignored. Otherwise fall back to the saved file.
+// Precedence, highest first:
+//   1. --profile flag        2. OPAQ_PROFILE env
+//   3. OPAQ_SERVER+OPAQ_KEY raw env (all-or-nothing)   4. the `default` profile
 fn resolve_config(
+    flag_profile: Option<String>,
+    env_profile: Option<String>,
     env_server: Option<String>,
     env_key: Option<String>,
-    file: Option<CliConfig>,
+    store: Option<ProfileStore>,
 ) -> CliResult<CliConfig> {
+    // An explicitly named profile (flag or env) takes precedence over raw env creds.
+    if let Some(name) = flag_profile.or(env_profile) {
+        return pick_profile(store, &name, true);
+    }
     match (env_server, env_key) {
         (Some(server), Some(api_key)) => Ok(CliConfig { server, api_key }),
         (Some(_), None) => Err("OPAQ_SERVER is set but OPAQ_KEY is missing.".to_string()),
         (None, Some(_)) => Err("OPAQ_KEY is set but OPAQ_SERVER is missing.".to_string()),
-        (None, None) => file.ok_or_else(|| {
-            "not logged in. Run `opaq login --server URL --key KEY`, or set OPAQ_SERVER and OPAQ_KEY."
-                .to_string()
-        }),
+        (None, None) => pick_profile(store, "default", false),
     }
 }
 
-fn load_config_file() -> CliResult<CliConfig> {
-    let path = config_path();
-    let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&data).map_err(|e| format!("invalid config: {}", e))
+fn pick_profile(store: Option<ProfileStore>, name: &str, explicit: bool) -> CliResult<CliConfig> {
+    let store = match store {
+        Some(s) => s,
+        None => {
+            return Err(if explicit {
+                format!("profile '{}' not found", name)
+            } else {
+                "not logged in. Run `opaq login --server URL --key KEY`, or set OPAQ_SERVER and OPAQ_KEY."
+                    .to_string()
+            });
+        }
+    };
+    store
+        .profiles
+        .get(name)
+        .map(|c| CliConfig { server: c.server.clone(), api_key: c.api_key.clone() })
+        .ok_or_else(|| {
+            if explicit {
+                format!("profile '{}' not found", name)
+            } else {
+                "not logged in. Run `opaq login --server URL --key KEY`, or set OPAQ_SERVER and OPAQ_KEY."
+                    .to_string()
+            }
+        })
 }
 
-fn save_config(config: &CliConfig) -> CliResult<()> {
+// The profile name that would resolve as active given flag/env, ignoring raw
+// env creds (which are not a named profile). Used only for display in `profile list`.
+fn active_profile_name(flag_profile: Option<String>) -> String {
+    flag_profile
+        .or_else(|| env_var("OPAQ_PROFILE"))
+        .unwrap_or_else(|| "default".to_string())
+}
+
+// Reads the config file into a ProfileStore. If the file was the legacy flat
+// shape, it is migrated and rewritten in place so the next read is the new shape.
+fn load_store() -> CliResult<ProfileStore> {
+    let path = config_path();
+    let data = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let was_flat = serde_json::from_str::<ProfileStore>(&data).is_err();
+    let store = parse_store(&data)?;
+    if was_flat {
+        // Best-effort: a readable legacy config must still resolve even if the
+        // migration rewrite can't be persisted (e.g. read-only filesystem).
+        let _ = save_store(&store);
+    }
+    Ok(store)
+}
+
+fn save_store(store: &ProfileStore) -> CliResult<()> {
     let path = config_path();
     let parent = path
         .parent()
         .ok_or_else(|| "could not determine config directory".to_string())?;
     std::fs::create_dir_all(parent).map_err(|e| format!("failed to create config dir: {}", e))?;
-    let body = serde_json::to_string_pretty(config)
+    let body = serde_json::to_string_pretty(store)
         .map_err(|e| format!("failed to serialize config: {}", e))?;
     std::fs::write(&path, body).map_err(|e| format!("failed to write config: {}", e))?;
     #[cfg(unix)]
@@ -813,6 +900,7 @@ fn format_unix_secs(s: &str) -> String {
 
 fn run() -> CliResult<()> {
     let cli = Cli::parse();
+    let profile = cli.profile.clone();
 
     match cli.command {
         Command::Genkey { length } => {
@@ -830,16 +918,16 @@ fn run() -> CliResult<()> {
             Ok(())
         }
         Command::Login { server, key } => {
-            let config = CliConfig {
-                server,
-                api_key: key,
-            };
-            save_config(&config)?;
-            println!("Logged in.");
+            let name = profile.clone().unwrap_or_else(|| "default".to_string());
+            // Preserve any existing profiles; start fresh if no file yet.
+            let mut store = load_store().unwrap_or_default();
+            store.profiles.insert(name.clone(), CliConfig { server, api_key: key });
+            save_store(&store)?;
+            println!("Logged in (profile: {}).", name);
             Ok(())
         }
         Command::Status => {
-            let config = load_config()?;
+            let config = load_config(profile.clone())?;
             let url = api_url(&config, "me");
             let resp = client()
                 .get(&url)
@@ -878,7 +966,7 @@ fn run() -> CliResult<()> {
             json,
             json_path,
         } => {
-            let config = load_config()?;
+            let config = load_config(profile.clone())?;
             let (ws, proj, env, key) = parse_secret_path(&path)?;
 
             let (val, vtype) = match (string, string_path, json, json_path) {
@@ -933,7 +1021,7 @@ fn run() -> CliResult<()> {
             }
         }
         Command::Get { path, raw } => {
-            let config = load_config()?;
+            let config = load_config(profile.clone())?;
             let (ws, proj, env, key) = parse_secret_path(&path)?;
             let url = api_url(&config, &secret_url_path(ws, proj, env, key));
             let resp = client()
@@ -962,7 +1050,7 @@ fn run() -> CliResult<()> {
             values,
             no_merge,
         } => {
-            let config = load_config()?;
+            let config = load_config(profile.clone())?;
             let (ws, proj, env_opt) = parse_path3(&path)?;
             let mut url = match &env_opt {
                 Some(env) => api_url(&config, &format!("list/{}/{}/{}", ws, proj, env)),
@@ -1006,7 +1094,7 @@ fn run() -> CliResult<()> {
             shell,
             preserve_case,
         } => {
-            let config = load_config()?;
+            let config = load_config(profile.clone())?;
             let trimmed = path.trim_matches('/');
             let parts: Vec<&str> = trimmed.split('/').collect();
             if parts.len() != 3 || parts.iter().any(|s| s.is_empty()) {
@@ -1084,7 +1172,7 @@ fn run() -> CliResult<()> {
             Ok(())
         }
         Command::Rm { path } => {
-            let config = load_config()?;
+            let config = load_config(profile.clone())?;
             let (ws, proj, env, key) = parse_secret_path(&path)?;
             let url = api_url(&config, &secret_url_path(ws, proj, env, key));
             let resp = client()
@@ -1108,7 +1196,7 @@ fn run() -> CliResult<()> {
                 no_ttl,
                 rename,
             } => {
-                let config = load_config()?;
+                let config = load_config(profile.clone())?;
                 let ttl_seconds = ttl.as_deref().map(parse_ttl).transpose()?;
                 let mut payload = serde_json::json!({ "name": name });
                 if let Some(r) = &role {
@@ -1164,7 +1252,7 @@ fn run() -> CliResult<()> {
                 Ok(())
             }
             PrincipalCmd::List => {
-                let config = load_config()?;
+                let config = load_config(profile.clone())?;
                 let url = api_url(&config, "principals");
                 let resp = client()
                     .get(&url)
@@ -1205,7 +1293,7 @@ fn run() -> CliResult<()> {
                 Ok(())
             }
             PrincipalCmd::Rotate { id, name } => {
-                let config = load_config()?;
+                let config = load_config(profile.clone())?;
                 let resolved_name = match (id, name) {
                     (Some(id), _) => lookup_principal_name_by_id(&config, id)?,
                     (None, Some(name)) => name,
@@ -1246,7 +1334,7 @@ fn run() -> CliResult<()> {
                 Ok(())
             }
             PrincipalCmd::Revoke { id, name } => {
-                let config = load_config()?;
+                let config = load_config(profile.clone())?;
                 let resolved_id = match (id, name) {
                     (Some(id), _) => id,
                     (None, Some(name)) => lookup_principal_id_by_name(&config, &name)?,
@@ -1268,6 +1356,41 @@ fn run() -> CliResult<()> {
             }
         },
         Command::Help { topic } => help::print_cheatsheet(topic.as_deref()),
+        Command::Profile { cmd } => match cmd {
+            ProfileCmd::List => {
+                let store = load_store().unwrap_or_default();
+                if store.profiles.is_empty() {
+                    println!("No profiles. Run `opaq login` to create one.");
+                    return Ok(());
+                }
+                let active = active_profile_name(profile.clone());
+                for (name, conf) in &store.profiles {
+                    let marker = if *name == active { "*" } else { " " };
+                    let key_tail = if conf.api_key.len() >= 4 {
+                        &conf.api_key[conf.api_key.len() - 4..]
+                    } else {
+                        conf.api_key.as_str()
+                    };
+                    println!(
+                        "{} {}  {}  {}",
+                        marker,
+                        bold(name),
+                        conf.server,
+                        dim(&format!("...{}", key_tail)),
+                    );
+                }
+                Ok(())
+            }
+            ProfileCmd::Remove { name } => {
+                let mut store = load_store().unwrap_or_default();
+                if store.profiles.remove(&name).is_none() {
+                    return Err(format!("profile '{}' not found", name));
+                }
+                save_store(&store)?;
+                println!("Removed profile: {}", name);
+                Ok(())
+            }
+        },
     }
 }
 
@@ -1329,48 +1452,157 @@ mod parse_ttl_tests {
 
 #[cfg(test)]
 mod resolve_config_tests {
-    use super::{resolve_config, CliConfig};
+    use super::{resolve_config, CliConfig, ProfileStore};
+    use std::collections::BTreeMap;
 
-    fn file() -> Option<CliConfig> {
-        Some(CliConfig {
-            server: "https://file.example.com".into(),
-            api_key: "file_key".into(),
-        })
+    fn store() -> Option<ProfileStore> {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "default".into(),
+            CliConfig { server: "https://default.com".into(), api_key: "dk".into() },
+        );
+        profiles.insert(
+            "work".into(),
+            CliConfig { server: "https://work.com".into(), api_key: "wk".into() },
+        );
+        Some(ProfileStore { profiles })
     }
 
     #[test]
-    fn env_both_skips_file() {
+    fn flag_profile_wins_over_env_creds() {
         let conf = resolve_config(
-            Some("https://env.example.com".into()),
-            Some("env_key".into()),
+            Some("work".into()),
             None,
+            Some("https://env.com".into()),
+            Some("ek".into()),
+            store(),
         )
         .unwrap();
-        assert_eq!(conf.server, "https://env.example.com");
-        assert_eq!(conf.api_key, "env_key");
+        assert_eq!(conf.server, "https://work.com");
     }
 
     #[test]
-    fn partial_env_errors_even_with_file() {
-        // env is all-or-nothing: one var set never merges with the file
-        assert!(resolve_config(Some("https://env.example.com".into()), None, file()).is_err());
-        assert!(resolve_config(None, Some("env_key".into()), file()).is_err());
+    fn env_profile_selects_named() {
+        let conf = resolve_config(None, Some("work".into()), None, None, store()).unwrap();
+        assert_eq!(conf.api_key, "wk");
     }
 
     #[test]
-    fn file_only_when_no_env() {
-        let conf = resolve_config(None, None, file()).unwrap();
-        assert_eq!(conf.server, "https://file.example.com");
-        assert_eq!(conf.api_key, "file_key");
+    fn named_profile_not_found_errors() {
+        assert!(resolve_config(Some("nope".into()), None, None, None, store()).is_err());
     }
 
     #[test]
-    fn errors_when_no_env_and_no_file() {
-        assert!(resolve_config(None, None, None).is_err());
+    fn raw_env_creds_when_no_profile() {
+        let conf = resolve_config(
+            None,
+            None,
+            Some("https://env.com".into()),
+            Some("ek".into()),
+            store(),
+        )
+        .unwrap();
+        assert_eq!(conf.server, "https://env.com");
     }
 
     #[test]
-    fn errors_when_partial_env_and_no_file() {
-        assert!(resolve_config(Some("https://env.example.com".into()), None, None).is_err());
+    fn partial_env_errors() {
+        assert!(resolve_config(None, None, Some("https://env.com".into()), None, store()).is_err());
+        assert!(resolve_config(None, None, None, Some("ek".into()), store()).is_err());
+    }
+
+    #[test]
+    fn falls_through_to_default() {
+        let conf = resolve_config(None, None, None, None, store()).unwrap();
+        assert_eq!(conf.server, "https://default.com");
+    }
+
+    #[test]
+    fn errors_when_nothing_set_and_no_store() {
+        let err = resolve_config(None, None, None, None, None).unwrap_err();
+        assert!(err.contains("not logged in"), "expected 'not logged in', got: {}", err);
+        assert!(!err.contains("not found"), "expected no 'not found', got: {}", err);
+    }
+
+    #[test]
+    fn explicit_profile_not_found_when_no_store() {
+        let err = resolve_config(Some("ghost".into()), None, None, None, None).unwrap_err();
+        assert!(
+            err.contains("profile 'ghost' not found"),
+            "expected 'profile 'ghost' not found', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn env_profile_wins_over_raw_env_creds() {
+        let conf = resolve_config(
+            None,
+            Some("work".into()),
+            Some("https://env.com".into()),
+            Some("ek".into()),
+            store(),
+        )
+        .unwrap();
+        assert_eq!(conf.server, "https://work.com");
+    }
+
+    #[test]
+    fn flag_profile_wins_over_env_profile() {
+        let conf =
+            resolve_config(Some("work".into()), Some("default".into()), None, None, store())
+                .unwrap();
+        assert_eq!(conf.server, "https://work.com");
+    }
+
+    #[test]
+    fn errors_when_default_missing() {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "work".into(),
+            CliConfig { server: "https://work.com".into(), api_key: "wk".into() },
+        );
+        let store = Some(ProfileStore { profiles });
+        assert!(resolve_config(None, None, None, None, store).is_err());
+    }
+}
+
+#[cfg(test)]
+mod profile_store_tests {
+    use super::{parse_store, CliConfig, ProfileStore};
+
+    #[test]
+    fn parses_new_shape() {
+        let json = r#"{"profiles":{"work":{"server":"https://w.com","api_key":"wk"}}}"#;
+        let store = parse_store(json).unwrap();
+        assert_eq!(store.profiles["work"].server, "https://w.com");
+        assert_eq!(store.profiles["work"].api_key, "wk");
+    }
+
+    #[test]
+    fn migrates_flat_shape_into_default() {
+        // old config.json was a bare {server, api_key}
+        let json = r#"{"server":"https://old.com","api_key":"oldkey"}"#;
+        let store = parse_store(json).unwrap();
+        assert_eq!(store.profiles.len(), 1);
+        assert_eq!(store.profiles["default"].server, "https://old.com");
+        assert_eq!(store.profiles["default"].api_key, "oldkey");
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(parse_store("not json").is_err());
+    }
+
+    #[test]
+    fn round_trips_through_serde() {
+        let mut store = ProfileStore::default();
+        store.profiles.insert(
+            "default".into(),
+            CliConfig { server: "https://s.com".into(), api_key: "k".into() },
+        );
+        let json = serde_json::to_string(&store).unwrap();
+        let back = parse_store(&json).unwrap();
+        assert_eq!(back.profiles["default"].server, "https://s.com");
     }
 }
