@@ -19,6 +19,22 @@ opaq get /acme/api/prod/STRIPE_KEY --raw | pbcopy
 opaq env /acme/api/prod
 ```
 
+### Profiles
+
+Manage multiple credential sets (server + key) in one config, AWS-style. `opaq login`
+without `--profile` writes the `default` profile; an existing single-credential config
+is migrated to `default` automatically.
+
+```sh
+opaq login --profile work --server https://work.opaq.com --key opaq_xyz
+opaq get /acme/api/prod/STRIPE_KEY --profile work   # --profile works on any command
+opaq profile list                                    # * marks the active profile
+opaq profile remove work
+```
+
+Active profile is resolved in this order: `--profile` flag → `OPAQ_PROFILE` env →
+`OPAQ_SERVER`+`OPAQ_KEY` raw env → the `default` profile.
+
 ### Env credentials (CI / Docker)
 
 Set `OPAQ_SERVER` and `OPAQ_KEY` to make calls without running `opaq login` — handy
