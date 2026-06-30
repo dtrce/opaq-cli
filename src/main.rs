@@ -413,7 +413,9 @@ fn load_store() -> CliResult<ProfileStore> {
     let was_flat = serde_json::from_str::<ProfileStore>(&data).is_err();
     let store = parse_store(&data)?;
     if was_flat {
-        save_store(&store)?;
+        // Best-effort: a readable legacy config must still resolve even if the
+        // migration rewrite can't be persisted (e.g. read-only filesystem).
+        let _ = save_store(&store);
     }
     Ok(store)
 }
