@@ -204,6 +204,11 @@ Topics:
         /// Topic: auth | secrets | admin | paths | examples
         topic: Option<String>,
     },
+    /// Manage credential profiles
+    Profile {
+        #[command(subcommand)]
+        cmd: ProfileCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -276,6 +281,17 @@ Examples:
     },
     /// List principals
     List,
+}
+
+#[derive(Subcommand)]
+enum ProfileCmd {
+    /// List saved profiles
+    List,
+    /// Remove a saved profile
+    Remove {
+        /// Profile name to delete
+        name: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -379,6 +395,14 @@ fn pick_profile(store: Option<ProfileStore>, name: &str, explicit: bool) -> CliR
                     .to_string()
             }
         })
+}
+
+// The profile name that would resolve as active given flag/env, ignoring raw
+// env creds (which are not a named profile). Used only for display in `profile list`.
+fn active_profile_name(flag_profile: Option<String>) -> String {
+    flag_profile
+        .or_else(|| env_var("OPAQ_PROFILE"))
+        .unwrap_or_else(|| "default".to_string())
 }
 
 // Reads the config file into a ProfileStore. If the file was the legacy flat
@@ -1330,6 +1354,41 @@ fn run() -> CliResult<()> {
             }
         },
         Command::Help { topic } => help::print_cheatsheet(topic.as_deref()),
+        Command::Profile { cmd } => match cmd {
+            ProfileCmd::List => {
+                let store = load_store().unwrap_or_default();
+                if store.profiles.is_empty() {
+                    println!("No profiles. Run `opaq login` to create one.");
+                    return Ok(());
+                }
+                let active = active_profile_name(profile.clone());
+                for (name, conf) in &store.profiles {
+                    let marker = if *name == active { "*" } else { " " };
+                    let key_tail = if conf.api_key.len() >= 4 {
+                        &conf.api_key[conf.api_key.len() - 4..]
+                    } else {
+                        conf.api_key.as_str()
+                    };
+                    println!(
+                        "{} {}  {}  {}",
+                        marker,
+                        bold(name),
+                        conf.server,
+                        dim(&format!("...{}", key_tail)),
+                    );
+                }
+                Ok(())
+            }
+            ProfileCmd::Remove { name } => {
+                let mut store = load_store().unwrap_or_default();
+                if store.profiles.remove(&name).is_none() {
+                    return Err(format!("profile '{}' not found", name));
+                }
+                save_store(&store)?;
+                println!("Removed profile: {}", name);
+                Ok(())
+            }
+        },
     }
 }
 
