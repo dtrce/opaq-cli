@@ -278,7 +278,7 @@ Examples:
     List,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct CliConfig {
     server: String,
     api_key: String,
@@ -345,26 +345,40 @@ fn resolve_config(
 ) -> CliResult<CliConfig> {
     // An explicitly named profile (flag or env) takes precedence over raw env creds.
     if let Some(name) = flag_profile.or(env_profile) {
-        return pick_profile(store, &name);
+        return pick_profile(store, &name, true);
     }
     match (env_server, env_key) {
         (Some(server), Some(api_key)) => Ok(CliConfig { server, api_key }),
         (Some(_), None) => Err("OPAQ_SERVER is set but OPAQ_KEY is missing.".to_string()),
         (None, Some(_)) => Err("OPAQ_KEY is set but OPAQ_SERVER is missing.".to_string()),
-        (None, None) => pick_profile(store, "default"),
+        (None, None) => pick_profile(store, "default", false),
     }
 }
 
-fn pick_profile(store: Option<ProfileStore>, name: &str) -> CliResult<CliConfig> {
-    let store = store.ok_or_else(|| {
-        "not logged in. Run `opaq login --server URL --key KEY`, or set OPAQ_SERVER and OPAQ_KEY."
-            .to_string()
-    })?;
+fn pick_profile(store: Option<ProfileStore>, name: &str, explicit: bool) -> CliResult<CliConfig> {
+    let store = match store {
+        Some(s) => s,
+        None => {
+            return Err(if explicit {
+                format!("profile '{}' not found", name)
+            } else {
+                "not logged in. Run `opaq login --server URL --key KEY`, or set OPAQ_SERVER and OPAQ_KEY."
+                    .to_string()
+            });
+        }
+    };
     store
         .profiles
         .get(name)
         .map(|c| CliConfig { server: c.server.clone(), api_key: c.api_key.clone() })
-        .ok_or_else(|| format!("profile '{}' not found", name))
+        .ok_or_else(|| {
+            if explicit {
+                format!("profile '{}' not found", name)
+            } else {
+                "not logged in. Run `opaq login --server URL --key KEY`, or set OPAQ_SERVER and OPAQ_KEY."
+                    .to_string()
+            }
+        })
 }
 
 // Reads the config file into a ProfileStore. If the file was the legacy flat
@@ -1444,7 +1458,40 @@ mod resolve_config_tests {
 
     #[test]
     fn errors_when_nothing_set_and_no_store() {
-        assert!(resolve_config(None, None, None, None, None).is_err());
+        let err = resolve_config(None, None, None, None, None).unwrap_err();
+        assert!(err.contains("not logged in"), "expected 'not logged in', got: {}", err);
+        assert!(!err.contains("not found"), "expected no 'not found', got: {}", err);
+    }
+
+    #[test]
+    fn explicit_profile_not_found_when_no_store() {
+        let err = resolve_config(Some("ghost".into()), None, None, None, None).unwrap_err();
+        assert!(
+            err.contains("profile 'ghost' not found"),
+            "expected 'profile 'ghost' not found', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn env_profile_wins_over_raw_env_creds() {
+        let conf = resolve_config(
+            None,
+            Some("work".into()),
+            Some("https://env.com".into()),
+            Some("ek".into()),
+            store(),
+        )
+        .unwrap();
+        assert_eq!(conf.server, "https://work.com");
+    }
+
+    #[test]
+    fn flag_profile_wins_over_env_profile() {
+        let conf =
+            resolve_config(Some("work".into()), Some("default".into()), None, None, store())
+                .unwrap();
+        assert_eq!(conf.server, "https://work.com");
     }
 
     #[test]
