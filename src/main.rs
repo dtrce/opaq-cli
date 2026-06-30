@@ -320,31 +320,48 @@ fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
-// Env vars win over the saved file so docker entrypoints can skip `opaq login`.
-// OPAQ_SERVER + OPAQ_KEY together are enough; either one alone overrides that
-// field on top of the stored config.
-fn load_config() -> CliResult<CliConfig> {
-    let env_server = env_var("OPAQ_SERVER");
-    let env_key = env_var("OPAQ_KEY");
-    resolve_config(env_server, env_key, load_config_file().ok())
+fn load_config(flag_profile: Option<String>) -> CliResult<CliConfig> {
+    resolve_config(
+        flag_profile,
+        env_var("OPAQ_PROFILE"),
+        env_var("OPAQ_SERVER"),
+        env_var("OPAQ_KEY"),
+        load_store().ok(),
+    )
 }
 
-// Env creds are all-or-nothing: if either OPAQ_SERVER or OPAQ_KEY is set, both must
-// be set and config.json is ignored. Otherwise fall back to the saved file.
+// Precedence, highest first:
+//   1. --profile flag        2. OPAQ_PROFILE env
+//   3. OPAQ_SERVER+OPAQ_KEY raw env (all-or-nothing)   4. the `default` profile
 fn resolve_config(
+    flag_profile: Option<String>,
+    env_profile: Option<String>,
     env_server: Option<String>,
     env_key: Option<String>,
-    file: Option<CliConfig>,
+    store: Option<ProfileStore>,
 ) -> CliResult<CliConfig> {
+    // An explicitly named profile (flag or env) takes precedence over raw env creds.
+    if let Some(name) = flag_profile.or(env_profile) {
+        return pick_profile(store, &name);
+    }
     match (env_server, env_key) {
         (Some(server), Some(api_key)) => Ok(CliConfig { server, api_key }),
         (Some(_), None) => Err("OPAQ_SERVER is set but OPAQ_KEY is missing.".to_string()),
         (None, Some(_)) => Err("OPAQ_KEY is set but OPAQ_SERVER is missing.".to_string()),
-        (None, None) => file.ok_or_else(|| {
-            "not logged in. Run `opaq login --server URL --key KEY`, or set OPAQ_SERVER and OPAQ_KEY."
-                .to_string()
-        }),
+        (None, None) => pick_profile(store, "default"),
     }
+}
+
+fn pick_profile(store: Option<ProfileStore>, name: &str) -> CliResult<CliConfig> {
+    let store = store.ok_or_else(|| {
+        "not logged in. Run `opaq login --server URL --key KEY`, or set OPAQ_SERVER and OPAQ_KEY."
+            .to_string()
+    })?;
+    store
+        .profiles
+        .get(name)
+        .map(|c| CliConfig { server: c.server.clone(), api_key: c.api_key.clone() })
+        .ok_or_else(|| format!("profile '{}' not found", name))
 }
 
 fn load_config_file() -> CliResult<CliConfig> {
@@ -1384,49 +1401,85 @@ mod parse_ttl_tests {
 
 #[cfg(test)]
 mod resolve_config_tests {
-    use super::{resolve_config, CliConfig};
+    use super::{resolve_config, CliConfig, ProfileStore};
+    use std::collections::BTreeMap;
 
-    fn file() -> Option<CliConfig> {
-        Some(CliConfig {
-            server: "https://file.example.com".into(),
-            api_key: "file_key".into(),
-        })
+    fn store() -> Option<ProfileStore> {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "default".into(),
+            CliConfig { server: "https://default.com".into(), api_key: "dk".into() },
+        );
+        profiles.insert(
+            "work".into(),
+            CliConfig { server: "https://work.com".into(), api_key: "wk".into() },
+        );
+        Some(ProfileStore { profiles })
     }
 
     #[test]
-    fn env_both_skips_file() {
+    fn flag_profile_wins_over_env_creds() {
         let conf = resolve_config(
-            Some("https://env.example.com".into()),
-            Some("env_key".into()),
+            Some("work".into()),
             None,
+            Some("https://env.com".into()),
+            Some("ek".into()),
+            store(),
         )
         .unwrap();
-        assert_eq!(conf.server, "https://env.example.com");
-        assert_eq!(conf.api_key, "env_key");
+        assert_eq!(conf.server, "https://work.com");
     }
 
     #[test]
-    fn partial_env_errors_even_with_file() {
-        // env is all-or-nothing: one var set never merges with the file
-        assert!(resolve_config(Some("https://env.example.com".into()), None, file()).is_err());
-        assert!(resolve_config(None, Some("env_key".into()), file()).is_err());
+    fn env_profile_selects_named() {
+        let conf = resolve_config(None, Some("work".into()), None, None, store()).unwrap();
+        assert_eq!(conf.api_key, "wk");
     }
 
     #[test]
-    fn file_only_when_no_env() {
-        let conf = resolve_config(None, None, file()).unwrap();
-        assert_eq!(conf.server, "https://file.example.com");
-        assert_eq!(conf.api_key, "file_key");
+    fn named_profile_not_found_errors() {
+        assert!(resolve_config(Some("nope".into()), None, None, None, store()).is_err());
     }
 
     #[test]
-    fn errors_when_no_env_and_no_file() {
-        assert!(resolve_config(None, None, None).is_err());
+    fn raw_env_creds_when_no_profile() {
+        let conf = resolve_config(
+            None,
+            None,
+            Some("https://env.com".into()),
+            Some("ek".into()),
+            store(),
+        )
+        .unwrap();
+        assert_eq!(conf.server, "https://env.com");
     }
 
     #[test]
-    fn errors_when_partial_env_and_no_file() {
-        assert!(resolve_config(Some("https://env.example.com".into()), None, None).is_err());
+    fn partial_env_errors() {
+        assert!(resolve_config(None, None, Some("https://env.com".into()), None, store()).is_err());
+        assert!(resolve_config(None, None, None, Some("ek".into()), store()).is_err());
+    }
+
+    #[test]
+    fn falls_through_to_default() {
+        let conf = resolve_config(None, None, None, None, store()).unwrap();
+        assert_eq!(conf.server, "https://default.com");
+    }
+
+    #[test]
+    fn errors_when_nothing_set_and_no_store() {
+        assert!(resolve_config(None, None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn errors_when_default_missing() {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "work".into(),
+            CliConfig { server: "https://work.com".into(), api_key: "wk".into() },
+        );
+        let store = Some(ProfileStore { profiles });
+        assert!(resolve_config(None, None, None, None, store).is_err());
     }
 }
 
