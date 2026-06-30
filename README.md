@@ -2,6 +2,8 @@
 
 CLI for [opaq](https://github.com/dtrce/opaq-server), a self-hosted config and secret store.
 
+> ⚠️ **Young project.** opaq is pre-1.0 and under active development. Breaking changes (commands, flags, config format) may land between releases until it stabilizes.
+
 ## Install
 
 ```sh
